@@ -20,21 +20,50 @@ import hashlib
 import json
 
 
+def canonical_payload_of(
+    device_id: str,
+    batch_id: str,
+    sequence: int,
+    observations: list[dict],
+    thresholds: dict,
+) -> dict:
+    """由批次字段重建规范化载荷（摘要输入）：排除 previous_digest 等摘要字段。
+
+    ``observations`` 为 ``[{captured_at, local_id}, …]``，``thresholds`` 为
+    /judge 四项阈值。链一致性核验用它从**已保存**的明细重算批次摘要。
+    """
+    return {
+        "batch_id": batch_id,
+        "device_id": device_id,
+        "max_drift": thresholds["max_drift"],
+        "max_false": thresholds["max_false"],
+        "max_missed": thresholds["max_missed"],
+        "observations": [
+            {"captured_at": o["captured_at"], "local_id": o["local_id"]}
+            for o in observations
+        ],
+        "sequence": sequence,
+        "tolerance": thresholds["tolerance"],
+    }
+
+
 def canonical_payload(device_id: str, req) -> dict:
     """批次的规范化载荷（摘要输入）：排除 previous_digest 等摘要字段。"""
-    return {
-        "batch_id": req.batch_id,
-        "device_id": device_id,
-        "max_drift": req.max_drift,
-        "max_false": req.max_false,
-        "max_missed": req.max_missed,
-        "observations": [
+    return canonical_payload_of(
+        device_id,
+        req.batch_id,
+        req.sequence,
+        [
             {"captured_at": o.captured_at, "local_id": o.local_id}
             for o in req.observations
         ],
-        "sequence": req.sequence,
-        "tolerance": req.tolerance,
-    }
+        {
+            "tolerance": req.tolerance,
+            "max_drift": req.max_drift,
+            "max_missed": req.max_missed,
+            "max_false": req.max_false,
+        },
+    )
 
 
 def compute_digest(payload: dict) -> str:

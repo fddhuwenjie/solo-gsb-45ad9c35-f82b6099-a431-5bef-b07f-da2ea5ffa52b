@@ -10,6 +10,7 @@ from .db import (
     BatchConflict,
     BatchJudgmentConflict,
     BatchNotFound,
+    ChainVerificationNotFound,
     ConsumerConflict,
     Database,
     ReplayConflict,
@@ -22,6 +23,7 @@ from .models import (
     BatchAckRequest,
     BatchJudgmentRequest,
     BatchUploadRequest,
+    ChainVerifyRequest,
     ConsumerRegisterRequest,
     JudgeRequest,
     LibraryImportRequest,
@@ -103,8 +105,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "规则，保存 judgment_id、序号范围、各批摘要与 library_version 作为"
             "不可变来源；幂等键重试返回原判定、改范围或设备 409，范围含墓碑或"
             "缺批次整体拒绝，归档/上传并发不会引用半个范围。"
+            "设备链一致性核验在单个只读 SQLite 事务内固定快照：逐批重算范围内"
+            "未归档批次的规范 SHA-256，核对 previous_digest 链、序号连续性、"
+            "batch_count/last_sequence/head_digest、archived_through 墓碑边界、"
+            "消费者确认摘要与水位及连续批次判定来源摘要，返回快照上限、ok 与"
+            "问题清单（issue_code/sequence/expected/actual），发现问题不改数据。"
         ),
-        version="1.8.0",
+        version="1.9.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -698,6 +705,33 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="batch judgment not found")
         return row
+
+    # ---------------- 设备链一致性核验（只读快照） ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/verify-chain",
+        summary="核验设备批次链一致性（只读快照，不改数据）",
+        description=(
+            "提交序号范围，服务在单个只读 SQLite 事务内固定快照：逐批重算范围内"
+            "未归档批次的规范 SHA-256 并与保存摘要比对，核对 previous_digest 链、"
+            "序号连续性、batch_count/last_sequence/head_digest、archived_through "
+            "墓碑边界与墓碑骨架、消费者确认摘要与连续水位、连续批次判定来源摘要；"
+            "归档批次只核对保存的摘要与边界。返回快照上限、ok 与问题清单"
+            "（issue_code/sequence/expected/actual）。并发上传、确认或归档期间"
+            "结果来自同一快照；发现问题不改任何数据。设备无批次或范围内缺批次"
+            "返回 404，范围非法返回 422。"
+        ),
+    )
+    def verify_device_chain(
+        req: ChainVerifyRequest,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            return app.state.db.verify_chain(
+                device_id, req.from_sequence, req.to_sequence
+            )
+        except ChainVerificationNotFound as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
 
     return app
 

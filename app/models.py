@@ -291,3 +291,23 @@ class ArchiveRequest(BaseModel):
     through_sequence: int = Field(
         ge=1, description="归档目标序号（含）：归档连续前缀 1..through_sequence"
     )
+
+
+class ChainVerifyRequest(BaseModel):
+    """设备批次链一致性核验：提交序号范围，服务在只读事务快照内核验。
+
+    范围内每个序号都必须已存在（缺批次返回 404）；未归档批次重算规范
+    SHA-256 并与保存摘要比对，归档批次只核对保存的摘要与墓碑边界。核验
+    为只读，不修改任何数据。
+    """
+
+    from_sequence: int = Field(ge=1, description="核验区间起始批次序号（含）")
+    to_sequence: int = Field(ge=1, description="核验区间结束批次序号（含）")
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "ChainVerifyRequest":
+        if self.from_sequence > self.to_sequence:
+            raise ValueError(
+                f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
+            )
+        return self

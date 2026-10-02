@@ -62,6 +62,16 @@
 归档或上传并发不会使已保存结果引用半个范围；批次随后归档，已保存的判定来源
 仍可完整查询。
 
+设备离线补传、归档或数据库迁移之后，运维可用
+`POST /field-devices/{device_id}/verify-chain` 对批次链做**一致性核验**，确认
+批次链仍可作为判定来源：提交设备编号与序号范围，服务在**单个只读 SQLite 事务**
+内固定快照，逐批重算范围内未归档批次的规范 SHA-256 并与保存摘要比对，核对
+`previous_digest` 链、序号连续性、`batch_count`/`last_sequence`/`head_digest`、
+`archived_through` 墓碑边界、消费者确认摘要与连续水位，以及连续批次判定
+（`batch_judgment_batches`）保存的来源摘要；归档批次只核对保存的摘要与边界。
+返回快照上限、`ok` 与问题清单（`issue_code`/`sequence`/`expected`/`actual`）；
+并发上传、确认或归档期间结果来自同一快照，核验**不修改任何数据**。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -122,6 +132,7 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/batch-judgments` | 对连续批次区间创建归档前巡检判定（幂等键；固定激活库版本，合并观测复用 `/judge`；重试 200，改范围/设备 409，含墓碑/缺批次/阈值不一致整体拒绝） |
 | `GET` | `/field-devices/{device_id}/batch-judgments` | 分页查询设备的连续批次判定（`after_id` 游标 + `limit`） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、判定结果） |
+| `POST` | `/field-devices/{device_id}/verify-chain` | 核验设备批次链一致性（只读快照：重算范围内未归档批次摘要，核对链式引用/序号连续性/链游标/墓碑边界/消费者确认与水位/判定来源摘要；不改数据，空设备或缺批次 404） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -876,6 +887,128 @@ curl -s "$DEV/batch-judgments/1"
 # 不属于该设备的 id 返回 404
 ```
 
+### 10. 设备链一致性核验（离线补传 / 归档 / 迁移后的运维核对）
+
+设备离线补传、前缀归档或数据库迁移之后，运维需要确认批次链仍可作为判定
+来源。`POST /field-devices/{device_id}/verify-chain` 在**单个只读 SQLite
+事务**中固定快照，对链做一次全面一致性核验——核验**只读不改数据**，发现
+问题只报告、不修复。
+
+**请求体**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `from_sequence` | `int≥1` | 核验区间起始批次序号（含），不得大于 `to_sequence` |
+| `to_sequence` | `int≥1` | 核验区间结束批次序号（含） |
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# 核验批次 1..10（范围内每个序号都必须已存在）
+curl -s -X POST $DEV/verify-chain \
+  -H 'Content-Type: application/json' \
+  -d '{"from_sequence": 1, "to_sequence": 10}' | python3 -m json.tool
+```
+
+```json
+{
+  "device_id": "dev-01",
+  "from_sequence": 1,
+  "to_sequence": 10,
+  "ok": true,
+  "issue_count": 0,
+  "issues": [],
+  "checked_batches": 10,
+  "recomputed_batches": 7,
+  "archived_batches": 3,
+  "checked_acknowledgments": 14,
+  "checked_judgment_sources": 4,
+  "snapshot": {
+    "head_sequence": 12,
+    "head_digest": "9c10bd…",
+    "batch_count": 12,
+    "archived_through": 3,
+    "safe_sequence": 9,
+    "consumer_count": 2,
+    "batch_judgment_count": 2
+  }
+}
+```
+
+**核验内容**（全部在事务开始时固定的同一快照内读取）：
+
+- **范围内未归档批次**：按保存的观测与四项阈值**重算规范 SHA-256**（与上传
+  时相同的规范化规则），与保存的 `digest` 比对；并核对 `observation_count`
+  与实际观测条数；
+- **归档批次（墓碑）**：明细已清空，**不重算**，只核对保存的摘要经
+  `previous_digest` 链式引用与相邻批次互相印证，以及墓碑边界与骨架；
+- **`previous_digest` 链**（全链）：每批保存的前序摘要必须等于上一批保存的
+  摘要，首批必须为空串；
+- **序号连续性**（全链）：链上序号必须从 1 连续到链头，缺口逐序号报出；
+- **链游标**：`batch_count` / `last_sequence` / `head_digest` 必须与批次表
+  推导值一致，`archived_through` 不得越过链头；
+- **墓碑边界**（全链）：`sequence ≤ archived_through` 必须为墓碑（明细已
+  清空、状态一致），其后必须不是墓碑；
+- **消费者**：每条确认保存的 `batch_digest` 必须等于该批次当前摘要；水位
+  不得越过链头、不得低于 `archived_through`，且必须已按稀疏确认推进到
+  首个缺口（乱序确认形成的合法缺口不报问题）；
+- **连续批次判定来源**：`batch_judgment_batches` 保存的各批
+  `digest` / `previous_digest` / `batch_id` / `observation_count` 必须与
+  当前批次一致。
+
+结构核对（链式引用、序号、游标、边界、确认、判定来源）覆盖**整条链**；
+规范 SHA-256 重算只针对**请求范围内**的未归档批次。`snapshot` 给出核验
+时刻从批次表推导的**快照上限**（`head_sequence`/`head_digest`）与归档、
+水位上下文——即使只核验子区间，也能看到当时整条链延伸到哪里。
+
+**问题清单**：`ok=false` 时 `issues` 逐条给出
+`issue_code` / `sequence` / `expected` / `actual`（消费者问题附
+`consumer_id`，判定来源问题附 `batch_judgment_id`；`expected` 为核验
+推导值、`actual` 为库中保存值；链级问题的 `sequence` 为 `null`）：
+
+```json
+{
+  "ok": false,
+  "issue_count": 2,
+  "issues": [
+    {"issue_code": "digest_mismatch", "sequence": 4,
+     "expected": "49740f…", "actual": "00ab3d…"},
+    {"issue_code": "watermark_not_advanced", "sequence": 6,
+     "expected": 8, "actual": 5, "consumer_id": "ml-pipeline"}
+  ]
+}
+```
+
+| `issue_code` | 含义 |
+| --- | --- |
+| `digest_mismatch` | 范围内未归档批次重算摘要 ≠ 保存摘要 |
+| `observation_count_mismatch` | 保存的条数 ≠ 实际观测条数 |
+| `batch_details_missing` | 非墓碑批次缺观测/阈值明细，无法重算 |
+| `previous_digest_mismatch` | 保存的前序摘要 ≠ 上一批保存的摘要（首批应为空串） |
+| `sequence_gap` | 链上序号缺口（范围外缺口也报出） |
+| `batch_count_mismatch` / `last_sequence_mismatch` / `head_digest_mismatch` | 链游标与批次表推导值不一致 |
+| `head_batch_missing` / `chain_cursor_missing` | 游标指向的链头批次不存在 / 链游标行缺失 |
+| `archived_through_beyond_head` | 归档水位越过链头 |
+| `tombstone_boundary_violation` | 批次归档状态与 `archived_through` 边界不符 |
+| `tombstone_status_mismatch` / `tombstone_details_present` | 墓碑骨架不一致：状态列与归档时刻矛盾 / 明细未清空 |
+| `ack_digest_mismatch` / `ack_batch_missing` | 确认摘要与批次当前摘要不符 / 确认指向不存在的批次 |
+| `watermark_beyond_head` / `watermark_below_archived_through` / `watermark_not_advanced` | 水位越过链头 / 低于归档水位 / 未按稀疏确认推进到首个缺口 |
+| `judgment_source_digest_mismatch` 等 | 连续批次判定来源保存的摘要（或 `previous_digest`/`batch_id`/`observation_count`）与当前批次不一致；来源批次缺失为 `judgment_source_batch_missing` |
+
+**错误响应（4xx）**：
+
+- `422`：范围非法（`from_sequence < 1`、`from_sequence > to_sequence` 等，
+  由请求校验给出）；
+- `404 device_not_found`：设备没有任何批次（空设备）；
+- `404 batches_not_found`：范围内缺批次（含右端越过链头），`detail` 附
+  `head_sequence`、`missing_sequences`（缺失序号示例，至多 50 条）与
+  `missing_count`。
+
+**并发与只读保证**：核验在单个只读事务（`PRAGMA query_only` 兜底）内完成，
+并发上传、确认或归档期间，一次核验的全部读取都来自事务开始时固定的同一
+快照——每个写操作本身单事务原子提交，故核验结果恒为某一时刻的完整一致
+状态；核验不重写任何表，发现问题后数据库保持原样，可重复核验比对。
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -925,7 +1058,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放 + 连续批次判定共 126 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放 + 连续批次判定 + 链一致性核验共 160 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -941,7 +1074,7 @@ app/
   models.py  请求数据模型（Pydantic）
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
              设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
-             连续批次归档前巡检判定不可变来源，含首次迁移）
+             连续批次归档前巡检判定不可变来源 + 只读快照链一致性核验，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
