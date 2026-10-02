@@ -12,7 +12,9 @@ from .db import (
     BatchNotFound,
     ConsumerConflict,
     Database,
+    DeviceNotFound,
     ReplayConflict,
+    VerificationRangeNotFound,
     VersionConflict,
     VersionNotFound,
     VersionStateError,
@@ -22,6 +24,7 @@ from .models import (
     BatchAckRequest,
     BatchJudgmentRequest,
     BatchUploadRequest,
+    ChainVerificationRequest,
     ConsumerRegisterRequest,
     JudgeRequest,
     LibraryImportRequest,
@@ -103,8 +106,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "规则，保存 judgment_id、序号范围、各批摘要与 library_version 作为"
             "不可变来源；幂等键重试返回原判定、改范围或设备 409，范围含墓碑或"
             "缺批次整体拒绝，归档/上传并发不会引用半个范围。"
+            "运维可提交设备与序号范围做链一致性核验：单只读事务固定快照，"
+            "逐批复算未归档批次规范 SHA-256 并核对链指针、链游标、墓碑边界、"
+            "消费者确认摘要与水位及判定来源，返回 ok 与问题清单，发现问题不"
+            "改数据，结果与并发上传/确认/归档严格同快照。"
         ),
-        version="1.8.0",
+        version="1.9.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -698,6 +705,41 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="batch judgment not found")
         return row
+
+    @app.post(
+        "/field-devices/{device_id}/chain-verification",
+        summary="设备批次链一致性核验（只读快照内逐批复算，发现问题不改数据）",
+        description=(
+            "提交设备编号与序号范围，服务在单个只读 SQLite 事务内固定快照："
+            "逐批重算未归档批次的规范 SHA-256，核对 previous_digest 链、序号"
+            "连续性、batch_count/last_sequence/head_digest、archived_through "
+            "墓碑边界，以及消费者确认摘要与连续 watermark；归档批次只核对保存"
+            "的摘要、条数与墓碑边界；已有 batch_judgment_batches 的来源摘要在"
+            "区间内也须一致。返回快照上限（snapshot_head_sequence）、ok 与问题"
+            "清单（issue_code/sequence/expected/actual）。整个核验只读同一快照，"
+            "并发上传、确认或归档不影响结果且绝不修改数据。设备不存在或区间含"
+            "缺批次返回 404，范围非法返回 422。"
+        ),
+    )
+    def verify_device_chain(
+        req: ChainVerificationRequest,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            return app.state.db.verify_device_chain(
+                device_id, req.from_sequence, req.to_sequence
+            )
+        except DeviceNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "device_not_found",
+                    "message": str(exc),
+                    "device_id": exc.device_id,
+                },
+            )
+        except VerificationRangeNotFound as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
 
     return app
 

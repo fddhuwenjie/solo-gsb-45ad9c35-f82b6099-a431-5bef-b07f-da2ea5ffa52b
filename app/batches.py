@@ -37,6 +37,37 @@ def canonical_payload(device_id: str, req) -> dict:
     }
 
 
+def canonical_payload_from_row(
+    device_id: str,
+    *,
+    batch_id: str,
+    sequence: int,
+    observations: list[dict],
+    thresholds: dict,
+) -> dict:
+    """从持久化明细重建与 :func:`canonical_payload` 完全一致的规范化载荷。
+
+    一致性核验对**未归档**批次独立重算 SHA-256：输入取自设备批次表保存的
+    ``observations``（``captured_at``/``local_id``）与四项阈值
+    （``tolerance``/``max_drift``/``max_missed``/``max_false``），键集合、
+    嵌套结构、JSON 序列化规则必须与首次受理时逐字节相同（明细入库出库均为
+    JSON 往返，浮点按同一 IEEE-754 值序列化），故重算摘要应恒等于保存摘要。
+    """
+    return {
+        "batch_id": batch_id,
+        "device_id": device_id,
+        "max_drift": thresholds["max_drift"],
+        "max_false": thresholds["max_false"],
+        "max_missed": thresholds["max_missed"],
+        "observations": [
+            {"captured_at": o["captured_at"], "local_id": o["local_id"]}
+            for o in observations
+        ],
+        "sequence": sequence,
+        "tolerance": thresholds["tolerance"],
+    }
+
+
 def compute_digest(payload: dict) -> str:
     """UTF-8 键序 + 紧凑分隔符的 JSON 上计算 SHA-256（十六进制小写）。"""
     blob = json.dumps(

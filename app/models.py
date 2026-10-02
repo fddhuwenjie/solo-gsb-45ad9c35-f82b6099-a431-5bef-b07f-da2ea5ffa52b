@@ -291,3 +291,27 @@ class ArchiveRequest(BaseModel):
     through_sequence: int = Field(
         ge=1, description="归档目标序号（含）：归档连续前缀 1..through_sequence"
     )
+
+
+class ChainVerificationRequest(BaseModel):
+    """设备批次链一致性核验请求：提交待复核的序号区间（含端点）。
+
+    服务在**单个只读 SQLite 事务**内固定快照后逐批复算：区间内未归档批次
+    重算规范 SHA-256 并核对 ``previous_digest`` 链，归档批次只核对保存的摘要
+    与墓碑边界；链游标（``batch_count`` / ``last_sequence`` /
+    ``head_digest`` / ``archived_through``）、消费者确认摘要与连续水位、
+    已保存 batch_judgment 的来源摘要同样核对。发现问题只出问题清单，**不改
+    任何数据**。区间非法（``from_sequence > to_sequence``）返回 422；设备不
+    存在或区间含缺批次返回 404。
+    """
+
+    from_sequence: int = Field(ge=1, description="核验区间起始批次序号（含）")
+    to_sequence: int = Field(ge=1, description="核验区间结束批次序号（含）")
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "ChainVerificationRequest":
+        if self.from_sequence > self.to_sequence:
+            raise ValueError(
+                f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
+            )
+        return self

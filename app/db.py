@@ -73,6 +73,15 @@
 ``archived_through`` / ``archived_at`` 列（旧记录重放次数为零、归档水位
 回填为 0，最近事件回填为链头批次的受理事件）。批次表补墓碑列需要
 SQLite 表重建，迁移在单个事务内完成。
+
+设备链一致性核验（``verify_device_chain``，离线补传/归档/迁移后复核）：
+
+- 整个核验在**单个只读事务**（``BEGIN`` + ``PRAGMA query_only``）内完成，
+  所有读取来自同一一致性快照，发现问题只进问题清单，绝不写库；
+- 区间内未归档批次用保存明细经 :func:`canonical_payload_from_row` 重建
+  规范化载荷并复算 SHA-256，归档墓碑只核对保存摘要/条数/墓碑状态；
+  另全局核对链游标、序号连续性、墓碑边界、消费者确认摘要与连续水位、
+  已保存 batch_judgment 的来源摘要。设备从未出现或区间含缺批次抛 404。
 """
 from __future__ import annotations
 
@@ -84,7 +93,12 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .batches import canonical_payload, compute_digest, merge_batch_observations
+from .batches import (
+    canonical_payload,
+    canonical_payload_from_row,
+    compute_digest,
+    merge_batch_observations,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_versions (
@@ -328,6 +342,37 @@ class BatchJudgmentConflict(Exception):
         self.detail.update(extra)
 
 
+class DeviceNotFound(Exception):
+    """一致性核验的设备从未出现（无链、无任何批次，HTTP 404）。"""
+
+    def __init__(self, device_id: str):
+        super().__init__(f"device {device_id!r} has no batch chain")
+        self.device_id = device_id
+
+
+class VerificationRangeNotFound(Exception):
+    """核验区间含缺失批次序号（HTTP 404），detail 列出缺口与当前链头。"""
+
+    def __init__(
+        self, *, device_id: str, from_sequence: int, to_sequence: int,
+        missing_sequences: list[int], head_sequence: int,
+    ):
+        super().__init__(
+            f"cannot verify range {from_sequence}..{to_sequence} of device "
+            f"{device_id!r}: missing batch sequence(s) "
+            f"{', '.join(map(str, missing_sequences))}"
+        )
+        self.detail = {
+            "error": "verification_range_not_found",
+            "message": str(self),
+            "device_id": device_id,
+            "from_sequence": from_sequence,
+            "to_sequence": to_sequence,
+            "missing_sequences": missing_sequences,
+            "head_sequence": head_sequence,
+        }
+
+
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
@@ -384,6 +429,24 @@ class Database:
             except Exception:
                 conn.rollback()
                 raise
+
+    @contextmanager
+    def _read_tx(self):
+        """单连接单事务只读快照：BEGIN 后整段只读同一快照，异常时 ROLLBACK。
+
+        核验等只读多步操作在**同一个事务**内完成全部读取：SQLite 的读事务
+        持有一致性快照，期间即使发生并发上传/确认/归档（写者另起
+        BEGIN IMMEDIATE 并提交），本事务读到的始终是事务开始时的版本，
+        结果不会由半个快照拼成。``PRAGMA query_only`` 兜底确保核验路径上的
+        任何代码都无法写库——发现问题只能进问题清单。
+        """
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("PRAGMA query_only = ON")
+                conn.execute("BEGIN")
+                yield conn
+            finally:
+                conn.rollback()
 
     # ---------------- 首次迁移 ----------------
 
@@ -2157,4 +2220,374 @@ class Database:
             "count": len(items),
             "batch_judgments": items,
             "next_cursor": items[-1]["batch_judgment_id"] if has_more and items else None,
+        }
+
+    # ---------------- 设备批次链一致性核验（只读快照） ----------------
+
+    def verify_device_chain(
+        self, device_id: str, from_sequence: int, to_sequence: int
+    ) -> dict:
+        """在单个只读事务固定的快照内核验设备批次链一致性，绝不改数据。
+
+        核验分三层：
+
+        1. **链游标（全局）**：``last_sequence`` 等于链上最大序号且
+           ``1..last_sequence`` 连续无缺；``batch_count`` 等于链上批次数；
+           ``head_digest`` 等于末批保存摘要；``archived_through`` 不越界
+           （0 ≤ 值 ≤ last_sequence）且恰好为最大墓碑序号（墓碑连续前缀、
+           其后不得再有墓碑）。
+        2. **区间内逐批**（``from_sequence..to_sequence``，必须全部存在，
+           否则 404）：序号连续；``previous_digest`` 引用前一批保存摘要
+           （首批为空串）；未归档批次用保存的明细按与首次受理完全相同的
+           规范化规则**重算 SHA-256**，核对摘要与 ``observation_count``；
+           归档墓碑只核对保存摘要、条数与墓碑边界状态（明细已清空，无法
+           也无需重算）。
+        3. **消费者确认与判定来源（全局）**：每条确认引用的批次存在且
+           ``batch_digest`` 与批次保存摘要一致；各消费者缓存 ``watermark``
+           等于按稀疏确认重算的连续水位；已有 ``batch_judgment_batches``
+           对区间内序号保存的 ``previous_digest`` / ``digest`` /
+           ``observation_count`` 必须与当前批次一致。
+
+        设备从未出现（无链且无批次）抛 :class:`DeviceNotFound`（404）；
+        区间含缺批次抛 :class:`VerificationRangeNotFound`（404）。数据层面
+        的任何不一致只进入问题清单，返回 ``ok=False``。
+        """
+        issues: list[dict] = []
+
+        def add(code, *, sequence, expected, actual, **extra) -> None:
+            item = {
+                "issue_code": code,
+                "sequence": sequence,
+                "expected": expected,
+                "actual": actual,
+            }
+            item.update(extra)
+            issues.append(item)
+
+        with self._read_tx() as conn:
+            chain = conn.execute(
+                "SELECT * FROM device_chains WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            batch_rows = conn.execute(
+                "SELECT sequence, batch_id, previous_digest, digest, "
+                "observation_count, thresholds, observations, status, archived_at "
+                "FROM device_batches WHERE device_id = ? ORDER BY sequence",
+                (device_id,),
+            ).fetchall()
+
+            # 空设备：无链游标且无任何批次 → 404
+            if chain is None and not batch_rows:
+                raise DeviceNotFound(device_id)
+
+            by_seq = {r["sequence"]: r for r in batch_rows}
+            present_seqs = sorted(by_seq)
+            head_sequence = present_seqs[-1] if present_seqs else 0
+
+            # ---------- 链游标：last_sequence / 连续性 / batch_count ----------
+
+            if chain is None:
+                add(
+                    "chain_cursor_missing",
+                    sequence=None,
+                    expected="device_chains row present",
+                    actual=None,
+                )
+                cursor_last = None
+                cursor_count = None
+                cursor_head = None
+                cursor_archived = None
+            else:
+                cursor_last = chain["last_sequence"]
+                cursor_count = chain["batch_count"]
+                cursor_head = chain["head_digest"]
+                cursor_archived = chain["archived_through"]
+                if cursor_last != head_sequence:
+                    add(
+                        "last_sequence_mismatch",
+                        sequence=None,
+                        expected=head_sequence,
+                        actual=cursor_last,
+                    )
+                gaps = [
+                    s for s in range(1, head_sequence + 1) if s not in by_seq
+                ]
+                if gaps:
+                    add(
+                        "sequence_gap",
+                        sequence=gaps[0],
+                        expected="contiguous prefix 1..last_sequence",
+                        actual={"missing_sequences": gaps},
+                    )
+                if cursor_count != len(batch_rows):
+                    add(
+                        "batch_count_mismatch",
+                        sequence=None,
+                        expected=len(batch_rows),
+                        actual=cursor_count,
+                    )
+
+            # ---------- 链游标：head_digest ----------
+
+            expected_head = by_seq[head_sequence]["digest"] if head_sequence else ""
+            if cursor_head is not None and cursor_head != expected_head:
+                add(
+                    "head_digest_mismatch",
+                    sequence=head_sequence or None,
+                    expected=expected_head,
+                    actual=cursor_head,
+                )
+
+            # ---------- 区间前置：缺批次 → 404（明确的客户端错误） ----------
+
+            missing = [
+                s
+                for s in range(from_sequence, to_sequence + 1)
+                if s not in by_seq
+            ]
+            if missing:
+                raise VerificationRangeNotFound(
+                    device_id=device_id,
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                    missing_sequences=missing,
+                    head_sequence=head_sequence,
+                )
+
+            # ---------- 链游标：archived_through 墓碑边界（全局） ----------
+
+            archived_seqs = sorted(
+                r["sequence"] for r in batch_rows if r["archived_at"] is not None
+            )
+            expected_archived_through = archived_seqs[-1] if archived_seqs else 0
+            if cursor_archived is not None:
+                if cursor_archived < 0 or cursor_archived > head_sequence:
+                    add(
+                        "archived_boundary_mismatch",
+                        sequence=cursor_archived or None,
+                        expected=f"0 <= archived_through <= last_sequence {head_sequence}",
+                        actual=cursor_archived,
+                    )
+                elif cursor_archived != expected_archived_through:
+                    # 墓碑必须构成 1..archived_through 的连续前缀
+                    prefix = list(range(1, cursor_archived + 1))
+                    if archived_seqs[: len(prefix)] == prefix and len(archived_seqs) == len(prefix):
+                        actual_desc = cursor_archived
+                    else:
+                        actual_desc = {
+                            "archived_through": cursor_archived,
+                            "tombstone_sequences": archived_seqs,
+                        }
+                    add(
+                        "archived_boundary_mismatch",
+                        sequence=expected_archived_through or cursor_archived,
+                        expected=expected_archived_through,
+                        actual=actual_desc,
+                    )
+
+            # ---------- 区间内逐批：previous_digest 链、摘要、条数、墓碑 ----------
+
+            for seq in range(from_sequence, to_sequence + 1):
+                row = by_seq[seq]
+                is_tombstone = row["archived_at"] is not None
+                if seq == 1:
+                    expected_prev = ""
+                elif seq - 1 in by_seq:
+                    expected_prev = by_seq[seq - 1]["digest"]
+                else:
+                    # 前一批缺失：链断裂已由 sequence_gap 上报，
+                    # 不再对该行做 previous_digest 比对（无权威期望值）
+                    expected_prev = None
+                if expected_prev is not None and row["previous_digest"] != expected_prev:
+                    add(
+                        "previous_digest_mismatch",
+                        sequence=seq,
+                        expected=expected_prev,
+                        actual=row["previous_digest"],
+                    )
+
+                if is_tombstone:
+                    # 归档墓碑：只核对保存摘要/条数与墓碑边界（明细已清空）
+                    if row["observations"] is not None or row["thresholds"] is not None:
+                        add(
+                            "tombstone_state_mismatch",
+                            sequence=seq,
+                            expected={
+                                "observations": None,
+                                "thresholds": None,
+                                "status": "archived",
+                            },
+                            actual={
+                                "observations": "present"
+                                if row["observations"] is not None
+                                else None,
+                                "thresholds": "present"
+                                if row["thresholds"] is not None
+                                else None,
+                                "status": row["status"],
+                            },
+                        )
+                    if row["status"] != "archived":
+                        add(
+                            "tombstone_state_mismatch",
+                            sequence=seq,
+                            expected="archived",
+                            actual=row["status"],
+                        )
+                    continue
+
+                # 未归档：以保存明细按首次受理的同一规范化规则重算 SHA-256
+                if row["observations"] is None or row["thresholds"] is None:
+                    # 非墓碑却缺明细（损坏状态，正常 API 不会产生）：
+                    # 记录墓碑状态问题，跳过会抛异常的重算
+                    add(
+                        "tombstone_state_mismatch",
+                        sequence=seq,
+                        expected={
+                            "observations": "present",
+                            "thresholds": "present",
+                            "status": "accepted",
+                        },
+                        actual={
+                            "observations": None
+                            if row["observations"] is None
+                            else "present",
+                            "thresholds": None
+                            if row["thresholds"] is None
+                            else "present",
+                            "status": row["status"],
+                        },
+                    )
+                    continue
+                observations = json.loads(row["observations"])
+                thresholds = json.loads(row["thresholds"])
+                recalculated = compute_digest(
+                    canonical_payload_from_row(
+                        device_id,
+                        batch_id=row["batch_id"],
+                        sequence=row["sequence"],
+                        observations=observations,
+                        thresholds=thresholds,
+                    )
+                )
+                if recalculated != row["digest"]:
+                    add(
+                        "batch_digest_mismatch",
+                        sequence=seq,
+                        expected=recalculated,
+                        actual=row["digest"],
+                    )
+                if row["observation_count"] != len(observations):
+                    add(
+                        "observation_count_mismatch",
+                        sequence=seq,
+                        expected=len(observations),
+                        actual=row["observation_count"],
+                    )
+
+            # ---------- 消费者确认：摘要、悬空确认、连续水位 ----------
+
+            consumers = conn.execute(
+                "SELECT id, consumer_id, watermark FROM device_consumers "
+                "WHERE device_id = ? ORDER BY id",
+                (device_id,),
+            ).fetchall()
+            acks = conn.execute(
+                "SELECT consumer_id, sequence, batch_digest FROM device_batch_acks "
+                "WHERE device_id = ? ORDER BY consumer_id, sequence",
+                (device_id,),
+            ).fetchall()
+            acks_by_consumer: dict[str, list[sqlite3.Row]] = {}
+            for a in acks:
+                acks_by_consumer.setdefault(a["consumer_id"], []).append(a)
+
+            for a in acks:
+                batch = by_seq.get(a["sequence"])
+                if batch is None:
+                    add(
+                        "ack_dangling",
+                        sequence=a["sequence"],
+                        expected="acknowledged sequence exists on chain",
+                        actual=None,
+                        consumer_id=a["consumer_id"],
+                    )
+                    continue
+                # 确认摘要与水位全局核对（不受请求区间限制）：归档/未归档
+                # 批次的保存摘要都仍在墓碑骨架上，确认必须与之相符
+                if a["batch_digest"] != batch["digest"]:
+                    add(
+                        "ack_digest_mismatch",
+                        sequence=a["sequence"],
+                        expected=batch["digest"],
+                        actual=a["batch_digest"],
+                        consumer_id=a["consumer_id"],
+                    )
+
+            for c in consumers:
+                # 连续水位从墓碑边界起步（归档后登记的消费者无需确认已清空
+                # 明细的前缀）；墓碑边界本身的不一致已由上面的全局项上报
+                base = expected_archived_through
+                seqs = {a["sequence"] for a in acks_by_consumer.get(c["consumer_id"], [])}
+                wm = base
+                while wm + 1 in seqs and by_seq.get(wm + 1) is not None:
+                    wm += 1
+                if c["watermark"] != wm:
+                    add(
+                        "watermark_mismatch",
+                        sequence=wm,
+                        expected=wm,
+                        actual=c["watermark"],
+                        consumer_id=c["consumer_id"],
+                    )
+
+            # ---------- 已保存 batch_judgments 的来源摘要（区间内序号） ----------
+
+            source_rows = conn.execute(
+                "SELECT bj.id AS batch_judgment_id, bjb.sequence, bjb.batch_id, "
+                "bjb.previous_digest, bjb.digest, bjb.observation_count "
+                "FROM batch_judgment_batches bjb "
+                "JOIN batch_judgments bj ON bj.id = bjb.batch_judgment_id "
+                "WHERE bj.device_id = ? AND bjb.sequence >= ? AND bjb.sequence <= ? "
+                "ORDER BY bj.id, bjb.sequence",
+                (device_id, from_sequence, to_sequence),
+            ).fetchall()
+            for s in source_rows:
+                batch = by_seq.get(s["sequence"])
+                if batch is None:
+                    add(
+                        "batch_judgment_source_mismatch",
+                        sequence=s["sequence"],
+                        expected="source sequence exists on chain",
+                        actual=None,
+                        batch_judgment_id=s["batch_judgment_id"],
+                    )
+                    continue
+                for field in ("previous_digest", "digest", "observation_count"):
+                    if s[field] != batch[field]:
+                        add(
+                            "batch_judgment_source_mismatch",
+                            sequence=s["sequence"],
+                            expected=batch[field],
+                            actual=s[field],
+                            batch_judgment_id=s["batch_judgment_id"],
+                            field=field,
+                        )
+
+            snapshot = {
+                "head_sequence": head_sequence,
+                "head_digest": expected_head,
+                "batch_count": len(batch_rows),
+                "archived_through": expected_archived_through,
+                "consumer_count": len(consumers),
+                "snapshot_at": _iso(time.time()),
+            }
+
+        return {
+            "device_id": device_id,
+            "from_sequence": from_sequence,
+            "to_sequence": to_sequence,
+            "snapshot": snapshot,
+            "snapshot_head_sequence": head_sequence,
+            "ok": not issues,
+            "issue_count": len(issues),
+            "issues": issues,
         }
